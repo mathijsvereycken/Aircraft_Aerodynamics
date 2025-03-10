@@ -1,0 +1,353 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+def naca_camber(x, m, p, chord):
+    #creates the z_coordinate based on x for 4 digit NACA airfoil
+    z_c = np.where(
+        x <= p,
+        (m / (p ** 2)) * (2 * p * x - x ** 2),
+        (m / ((1 - p) ** 2)) * ((1 - 2 * p) + 2 * p * x - x ** 2)
+    )
+    return z_c
+
+def n_control_points(vp, m, p, alpha):
+    #creates unit normal vector for each collocation point
+    segment = np.linspace(0, 1, vp+1)
+    x = segment[:-1] + (segment[1] - segment[0]) * 3 / 4
+    
+    rico = np.where(
+        x <= p,
+        (2 * m / (p**2)) * (p - x),
+        (2 * m / (1 - p)**2) * (p - x)
+    )
+    n_rico = np.array([-1 / rico]).T
+    normal = np.hstack([1 * np.sign(n_rico) / (1 + n_rico**2)**0.5, np.abs(n_rico) / (1 + n_rico**2)**0.5])
+    rotation_matrix = np.array([[np.cos(alpha), -np.sin(alpha)], [np.sin(alpha), np.cos(alpha)]])
+    uni_normal = normal @ rotation_matrix
+    return uni_normal
+
+def chord_geom(chord, vp, alpha, m, p):
+    """
+    Creates vortex and collocation points
+    Already rotate the airfoil instead of decomposing the free stream velocity into x and z component
+    """
+
+    # New version: already scales up distances to make sense
+    segment = np.linspace(0, 1, vp+1)
+    vortex_points_x = segment[:-1] + (segment[1] - segment[0]) / 4
+    control_points_x = segment[:-1] + (segment[1] - segment[0]) * 3 / 4
+    #displace final location for Kutta-condition
+    control_points_x[-1]= segment[-1]
+    
+    vortex_points_y = naca_camber(vortex_points_x, m, p, chord)
+    control_points_y = naca_camber(control_points_x, m, p, chord)
+    
+    vortex_points = np.column_stack((vortex_points_x, vortex_points_y))
+    control_points = np.column_stack((control_points_x, control_points_y))
+
+    rotation_matrix = np.array([[np.cos(alpha), -np.sin(alpha)], [np.sin(alpha), np.cos(alpha)]])
+
+    
+    vortex_points_rotated = vortex_points @ rotation_matrix
+    control_points_rotated = control_points @ rotation_matrix
+    
+    vortex_points_final = vortex_points_rotated * chord
+    control_points_final = control_points_rotated * chord
+
+
+    # calculate size per segment
+    segment_final = segment * chord
+    dC = segment_final[1:] - segment_final[:-1]
+    
+
+    return vortex_points_final, control_points_final, dC
+
+def vor2d(x, z, x_0, z_0):
+    #Calculate induced velocities of vortex onto arbitrary point
+    r_sq = (x - x_0)**2 + (z - z_0)**2
+    r_sq_array = np.array(r_sq)
+    r_sq_array[r_sq_array < 0.001] = 0.001
+    u = (z - z_0) / (2 * np.pi * r_sq_array)
+    w = (x - x_0) / (2 * np.pi * r_sq_array)
+    return u, w
+
+def compute_induced_velocity_matrix(vortex_points, control_points):
+    #Creates coefficient matrix which shows the induced velocities of vortex point i onto collocation point j
+    n = len(vortex_points)
+    m = len(control_points)
+    u_matrix = np.zeros((m, n))
+    w_matrix = np.zeros((m, n))
+    a_matrix = np.zeros((m, n))
+    for i in range(m):
+        for j in range(n):
+            u, w = vor2d(control_points[i, 0], control_points[i, 1], vortex_points[j, 0], vortex_points[j, 1])
+            u_matrix[i, j] = u
+            w_matrix[i, j] = w
+            a_matrix[i, j] = np.dot(np.array([u, w]), np.array([0, 1]))
+
+    return u_matrix, w_matrix, a_matrix
+
+def full_run(chord, vp, alpha, U_inf, m, p, rho):
+    #Solves linear system of equation
+    vortex_points, control_points, dC = chord_geom(chord, vp, alpha, m, p)
+    uni_normal = n_control_points(vp, m, p, alpha)
+    u_matrix, w_matrix, a_matrix = compute_induced_velocity_matrix(vortex_points, control_points)
+    RHS = np.dot(np.array([U_inf, 0]), uni_normal.T)
+    # Solve for vortex strengths (Gamma)
+    Gamma = np.linalg.solve(a_matrix, RHS)
+    # Calculating lift coefficient
+    Cl = ((2 * np.sum(Gamma)) / (U_inf * chord))
+    # Calculating the pressure coefficient
+    dCp = np.divide(2 * Gamma, U_inf * dC)
+
+    testing = np.sum(np.multiply(dCp, dC ))/chord
+
+    # Moment coefficient calculation
+    moment_arms = (np.append((vortex_points[:-1,0] + control_points[:-1,0]) / 2, (2 * vortex_points[-1,0] + control_points[-1,0]) / 3) -  0.25*chord * np.cos(alpha)) #moment-arm about the quarter chord
+    Cm = -np.sum(np.multiply( np.multiply(dCp,dC),  moment_arms))/(chord**2)
+
+    #x_c_vortex = (vortex_points[:, 0] + vortex_points[0, 0]) / chord
+    x_c = np.append((vortex_points[:-1,0] + control_points[:-1,0]) / (2 * chord), (2 * vortex_points[-1,0] + control_points[-1,0]) / (3 * chord))
+
+    return Cl, dCp, Cm, x_c
+
+
+# Parameters
+vp = 100
+chord = 1000
+U_inf = 1
+m = 0.01
+m_list = np.arange(0.01, 0.035, 0.01)
+p = 0.4
+p_list = np.arange(0.2, 0.7, 0.2)
+rho = 1.225
+alpha_list = np.arange(-6, 17, 1)
+
+# Line styles for consistency
+line_styles = ['k-', 'b--', 'r:']
+
+# --- Figure 1: Varying Maximum Camber ---
+fig1, axes1 = plt.subplots(1, 2, figsize=(12, 5))
+
+for idx, m_chamber in enumerate(m_list):
+    Cl, Cm = [], []
+    for alpha_deg in alpha_list:
+        alpha = alpha_deg * np.pi / 180
+        Cl_iter, dCp, Cm_iter, x_c = full_run(chord, vp, alpha, U_inf, m_chamber, p, rho)
+        Cl.append(Cl_iter)
+        Cm.append(Cm_iter)
+
+    # Plot Cl vs Alpha
+    axes1[0].plot(alpha_list, Cl, line_styles[idx % len(line_styles)], label=f"m = {m_chamber:.2f}")
+
+    # Plot Cm vs Alpha
+    axes1[1].plot(alpha_list, Cm, line_styles[idx % len(line_styles)], label=f"m = {m_chamber:.2f}")
+
+# Formatting for Cl plot
+axes1[0].set_xlabel("Angle of Attack (deg)")
+axes1[0].set_ylabel(r"Lift Coefficient ($C_L$)")
+axes1[0].set_title(r"$C_L$ vs $\alpha$ (Varying Max Camber)")
+axes1[0].legend()
+axes1[0].grid(True)
+
+# Formatting for Cm plot
+axes1[1].set_xlabel("Angle of Attack (deg)")
+axes1[1].set_ylabel(r"Moment Coefficient ($C_m$)")
+axes1[1].set_title(r"$C_m$ vs $\alpha$ (Varying Max Camber)")
+axes1[1].legend()
+axes1[1].grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# --- Figure 2: Varying Camber Location ---
+fig2, axes2 = plt.subplots(1, 2, figsize=(12, 5))
+
+for idx, p_chamber in enumerate(p_list):
+    Cl, Cm = [], []
+    for alpha_deg in alpha_list:
+        alpha = alpha_deg * np.pi / 180
+        Cl_iter, dCp, Cm_iter, x_c = full_run(chord, vp, alpha, U_inf, m, p_chamber, rho)
+        Cl.append(Cl_iter)
+        Cm.append(Cm_iter)
+
+    # Plot Cl vs Alpha
+    axes2[0].plot(alpha_list, Cl, line_styles[idx % len(line_styles)], label=f"p = {p_chamber:.1f}")
+
+    # Plot Cm vs Alpha
+    axes2[1].plot(alpha_list, Cm, line_styles[idx % len(line_styles)], label=f"p = {p_chamber:.1f}")
+
+# Formatting for Cl plot
+axes2[0].set_xlabel("Angle of Attack (deg)")
+axes2[0].set_ylabel(r"Lift Coefficient ($C_L$)")
+axes2[0].set_title(r"$C_L$ vs $\alpha$ (Varying Max Camber Location)")
+axes2[0].legend()
+axes2[0].grid(True)
+
+# Formatting for Cm plot
+axes2[1].set_xlabel("Angle of Attack (deg)")
+axes2[1].set_ylabel(r"Moment Coefficient ($C_m$)")
+axes2[1].set_title(r"$C_m$ vs $\alpha$ (Varying Max Camber Location)")
+axes2[1].legend()
+axes2[1].grid(True)
+
+plt.tight_layout()
+plt.show()
+
+
+# Load XFOIL Cp data
+filename = "xfoil_cp_alpha0_naca1412.dat"
+# Read data, skipping the header
+xfoil_data = np.loadtxt(filename, skiprows=3)  # Skip the first 3 lines of headers
+# Extract chordwise positions (x/c) and Cp values
+x_xfoil = xfoil_data[:, 0]  # Chordwise positions
+cp_xfoil = xfoil_data[:, 2]  # Pressure coefficient values
+# Separate upper and lower surface points
+x_upper = np.flip(x_xfoil[:81])
+cp_upper = np.flip(cp_xfoil[:81])
+x_lower = x_xfoil[80:]
+cp_lower = cp_xfoil[80:]
+# Define a new uniform x array from 0 to 1 with steps of 0.01
+x_uniform = np.linspace(0, 1, 1001)
+# Interpolate upper and lower Cp values to the uniform x array
+cp_upper_interp = np.interp(x_uniform, x_upper, cp_upper)
+cp_lower_interp = np.interp(x_uniform, x_lower, cp_lower)
+# Compute ΔCp
+delta_Cp = cp_lower_interp - cp_upper_interp
+# Plot ΔCp distribution
+plt.figure(figsize=(8, 6))
+plt.plot(x_uniform, delta_Cp, 'b--', label="XFOIL (inviscid)")
+
+# Load XFOIL Cp data viscous as no experimental data was found
+filename_visc = "xfoil_cp_alpha0_Re9e6_naca1412.dat"
+# Read data, skipping the header
+xfoil_data_visc = np.loadtxt(filename_visc, skiprows=3)  # Skip the first 3 lines of headers
+# Extract chordwise positions (x/c) and Cp values
+x_xfoil_visc = xfoil_data_visc[:, 0]  # Chordwise positions
+cp_xfoil_visc = xfoil_data_visc[:, 2]  # Pressure coefficient values
+# Separate upper and lower surface points
+x_upper_visc = np.flip(x_xfoil_visc[:81])
+cp_upper_visc = np.flip(cp_xfoil_visc[:81])
+x_lower_visc = x_xfoil_visc[80:]
+cp_lower_visc = cp_xfoil_visc[80:]
+# Define a new uniform x array from 0 to 1 with steps of 0.01
+x_uniform = np.linspace(0, 1, 1001)
+# Interpolate upper and lower Cp values to the uniform x array
+cp_upper_interp_visc = np.interp(x_uniform, x_upper_visc, cp_upper_visc)
+cp_lower_interp_visc = np.interp(x_uniform, x_lower_visc, cp_lower_visc)
+# Compute ΔCp
+delta_Cp_visc = cp_lower_interp_visc - cp_upper_interp_visc
+# Plot ΔCp distribution
+plt.plot(x_uniform, delta_Cp_visc, 'r:', label="XFOIL (Re = 9e6, $N_{Crit}$ = 9)")
+
+# Loop over AoA
+Cl = []
+Cm = []
+dCp_all = []
+### Cl-alpha loop
+for alpha_deg in alpha_list:
+    alpha = alpha_deg * np.pi / 180
+    Cl_iter, dCp, Cm_iter, x_c = full_run(chord, vp, alpha, U_inf, m, p, rho)
+    Cl.append(Cl_iter)
+    Cm.append(Cm_iter)
+    dCp_all.append(dCp)
+
+    if alpha_deg == 0:
+        plt.plot(x_c, dCp, 'black', label=f"Simulated")
+
+plt.xlabel("x/c")
+plt.ylabel(r"$\Delta C_p$")
+plt.legend()
+plt.title(r"$\Delta C_p$ for $\alpha$ = 0")
+plt.grid()
+plt.show()
+
+# Load XFOIL Cl and Cm data
+filename_cl_cm = "xfoil_cl_cm_naca1412.dat"
+# Read data, skipping the header
+xfoil_cl_cm = np.loadtxt(filename_cl_cm, skiprows=12)  # Skip the first 12 lines of headers
+# Extract chordwise positions (x/c) and Cp values
+xfoil_alpha = xfoil_cl_cm[:, 0]  # alpha
+xfoil_cl = xfoil_cl_cm[:, 1]  # Cl
+xfoil_cm = xfoil_cl_cm[:, 4]  # Cm
+
+# Experimental results from 'theory of wing sections'
+exp_alpha = np.append(np.arange(-6, 15, 2), np.array([15, 16]))
+exp_cl = np.array([-0.5, -0.28, -0.06, 0.15, 0.37, 0.58, 0.8, 0.99, 1.19, 1.38, 1.53, 1.58, 1.32])
+exp_cm = np.append(np.linspace(-0.09, -0.1, 11), np.array([-0.12, -0.2]))
+
+# Plot Cl-alpha
+plt.plot(alpha_list, Cl, 'black', label="Simulated")
+plt.plot(xfoil_alpha, xfoil_cl, 'b--', label='XFOIL (inviscid)')
+plt.plot(exp_alpha, exp_cl, 'r:', label='Experimental (Re = 9e6)')
+plt.xlabel(r"$\alpha$ (deg)")
+plt.ylabel(r"Lift Coefficient ($C_L$)")
+plt.title(r"$C_L$ vs. $\alpha$")
+plt.grid()
+plt.legend()
+plt.show()
+
+# Plot Cm-alpha
+plt.plot(alpha_list, Cm, 'black', label="Simulated")
+plt.plot(xfoil_alpha, xfoil_cm, 'b--', label='XFOIL (inviscid)')
+plt.plot(exp_alpha, exp_cm, 'r:', label='Experimental (Re = 9e6)')
+plt.xlabel(r"$\alpha$ (deg)")
+plt.ylabel(r"Moment Coefficient ($C_m$)")
+plt.title(r"$C_m$ vs. $\alpha$")
+plt.grid()
+plt.legend()
+plt.show()
+
+#Convergence loop
+
+vp_list = np.append(1, np.power(2,np.arange(1, 10, 1)))
+#vp_list = np.arange(1,31,1)
+dCl_dA = []
+### Loop for dCl/dalpha
+for n in vp_list:
+    alpha1 = -2.5 * np.pi / 180
+    alpha2 = 2.5 * np.pi / 180
+    Cl1, dCp, Cm_iter, x_c = full_run(chord, n, alpha1, U_inf, m, p, rho)
+    Cl2, dCp, Cm_iter, x_c = full_run(chord, n, alpha2, U_inf, m, p, rho)
+    #dCl_dA.append((Cl2 * np.cos(alpha2)  - Cl1 * np.cos(alpha1))/5)
+    dCl_dA.append((Cl2  - Cl1 ) / 5)
+
+# Theoretical lift slope
+dCl_dA_theory = 2 * np.pi**2 / 180
+# Compute relative error
+error = np.abs((np.array(dCl_dA) - dCl_dA_theory) / dCl_dA_theory)
+# Select two middle points for asymptotic convergence calculation
+mid_idx = len(vp_list) // 2  # Middle index
+x1, x2 = vp_list[mid_idx - 1], vp_list[mid_idx]  # Middle two points
+y1, y2 = error[mid_idx - 1], error[mid_idx]  # Corresponding errors
+# Compute the order of convergence (slope in log-log plot)
+slope = (np.log(y2) - np.log(y1)) / (np.log(x2) - np.log(x1))
+
+# Draw a red right triangle to visualize slope
+triangle_x = [x1, x2, x2, x2]  # Right triangle base
+triangle_y = [y1, y1, y1, y2]  # Right triangle height
+
+# Create a figure with 2 subplots (1 row, 2 columns)
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Plot dCl/dalpha with theoretical limit
+axes[0].plot(vp_list, dCl_dA, marker='o', label="Computed")
+axes[0].axhline(y=dCl_dA_theory, color="r", linestyle="--", label="Theoretical derivative")
+axes[0].set_xlabel("Number of Panels (N)")
+axes[0].set_ylabel("Lift Slope (1/deg)")
+axes[0].set_title("Lift Slope for differing N")
+axes[0].grid()
+axes[0].legend()
+
+# Plot log-log of relative error
+axes[1].loglog(vp_list, error, marker='o', label=f"Order of convergence: {slope:.2f}")
+axes[1].plot(triangle_x, triangle_y, 'r-', linewidth=2)  # Draw the triangle edges
+axes[1].set_xlabel("Number of Panels (N)")
+axes[1].set_ylabel("Relative Error")
+axes[1].set_title("Lift Slope Convergence")
+axes[1].grid(True, which="both", linestyle="--")
+axes[1].legend()
+
+# Show the figure
+plt.tight_layout()
+plt.show()
